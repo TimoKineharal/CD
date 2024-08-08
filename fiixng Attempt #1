@@ -1,0 +1,266 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import RPi.GPIO as GPIO
+import time
+from firebase import firebase
+import threading
+import uRAD_RP_SDK11  # Import uRAD library
+import os
+import csv
+import datetime
+
+# Stepper motor setup
+DIR = 6  # Direction GPIO Pin
+STEP = 7  # Step GPIO Pin
+steps_per_rev = 400  # Number of steps per revolution
+delay_secs_motor = 1  # Initialize delay_secs for motor rotation
+motor_running = False  # Flag to control motor running state
+total_steps = 0
+rotation_counter = 0  # Track the number of rotations
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(DIR, GPIO.OUT)
+GPIO.setup(STEP, GPIO.OUT)
+GPIO.output(DIR, GPIO.HIGH)
+
+# Firebase setup
+firebase_app = firebase.FirebaseApplication('https://coba-radar-default-rtdb.firebaseio.com', None)
+
+# uRAD radar setup parameters
+mode = 2  # sawtooth mode
+f0 = 5  # starting at 24.005 GHz
+BW = 240  # using all the BW available = 240 MHz
+Ns = 200  # 200 samples
+Ntar = 1  # 1 targets of interest
+Rmax = 100  # searching along the full distance range
+MTI = 0  # MTI mode disable because we want information of static and moving targets
+Mth = 0  # parameter not used because "movement" is not requested
+Alpha = 10  # signal has to be 10 dB higher than its surrounding
+distance_true = True  # Request distance information
+velocity_true = False  # mode 2 does not provide velocity information
+SNR_true = True  # Signal-to-Noise-Ratio information requested
+I_true = False  # In-Phase Component (RAW data) not requested
+Q_true = False  # Quadrature Component (RAW data) not requested
+movement_true = False  # Not interested in boolean movement detection
+rpmx = 0
+angle_degrees = 0
+target_distances = 0
+radar_distance = 0
+
+# Initialize the radar
+def initialize_radar():
+    return_code = uRAD_RP_SDK11.turnON()
+    if return_code != 0:
+        raise Exception("Failed to turn on uRAD")
+    return_code = uRAD_RP_SDK11.loadConfiguration(mode, f0, BW, Ns, Ntar, Rmax, MTI, Mth, Alpha, distance_true,
+                                                   velocity_true, SNR_true, I_true, Q_true, movement_true)
+    if return_code != 0:
+        raise Exception("Failed to load radar configuration")
+
+# Close the radar
+def close_radar():
+    return_code = uRAD_RP_SDK11.turnOFF()
+    if return_code != 0:
+        raise Exception("Failed to turn off uRAD")
+
+# Get radar data
+def get_radar_data():
+    return_code, results, raw_results = uRAD_RP_SDK11.detection()
+    if return_code != 0:
+        raise Exception("Failed to get radar data")
+    
+    NtarDetected = results[0]
+    distance = results[1]
+    SNR = results[3]
+
+    valid_targets = [(distance[i], SNR[i]) for i in range(NtarDetected) if SNR[i] > 0]
+    return valid_targets
+
+# Fetch the RPM value from Firebase
+def test_update_distance():
+    global angle_degrees, radar_distance
+    while True:
+        firebase_app.put("/", name="distance", data=round(radar_distance, 2))
+        firebase_app.put("/", name="degree", data=round(angle_degrees, 2))
+        time.sleep(0.1)
+
+def fetch_rpm():
+    global delay_secs_motor, motor_running
+    result = firebase_app.get('/rpm', None)
+    print(f"Fetched RPM from Firebase: {result}")
+    
+    if result == 0:
+        RPM = 0
+    elif result == 5:
+        RPM = 5
+    elif result == 10:
+        RPM = 10
+    elif result == 20:
+        RPM = 20
+    elif result == 30:
+        RPM = 30
+    else:
+        RPM = 0  # Default to 0 if result is None or unexpected value
+
+    with lock:
+        if RPM == 0:
+            motor_running = False
+        else:
+            motor_running = True
+            delay_secs_motor = 60 / (RPM * steps_per_rev)  # Update delay_secs_motor based on RPM
+        print(f"Calculated delay_secs_motor: {delay_secs_motor}, motor_running: {motor_running}")
+    return RPM
+
+# Initialize radar and cleanup on exit
+initialize_radar()
+def cleanup():
+    close_radar()
+
+# Directory where the plots will be saved
+save_directory = "radar_plots"
+if not os.path.exists(save_directory):
+    os.makedirs(save_directory)
+
+# Save the plot to a file
+def save_plot():
+    filename = f"{save_directory}/radar_plot_{int(time.time())}.jpg"
+    plt.savefig(filename, format='jpg')
+    print(f"Plot saved as {filename}")
+
+# CSV setup
+current_time = datetime.datetime.now()
+filePath = "/home/pi/mu_code/data_radar_csv" 
+csv_filename = f"radar-data-{current_time.year}-{current_time.month}-{current_time.day}-{current_time.hour}-{current_time.minute}-{current_time.second}.csv"
+path = os.path.join(filePath, csv_filename)
+csv_file = open(path, mode='a', newline='')
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["Timestamp", "Motor RPM", "Motor Angle (Degrees)", "Target Distances (m)"])
+
+# Write data to CSV
+def save_data_to_csv(rpm, angle_degrees, target_distances):
+    timestamp = time.time()
+    csv_writer.writerow([timestamp, rpm, angle_degrees, target_distances])
+    csv_file.flush()  # Ensure data is written to file immediately
+
+# Set up the radar plot
+fig = plt.figure(facecolor='k')
+ax = fig.add_subplot(111, polar=True, facecolor='#075604')
+r_max = 10.0
+ax.set_ylim([0.0, r_max])
+ax.set_xlim([0.0, 2 * np.pi])
+ax.set_rticks(np.linspace(0.0, r_max, 5))
+
+# Define the radial ticks and the corresponding labels
+r_ticks = np.linspace(0.0, r_max, 5)
+r_labels = [f"{r:.1f} m" for r in r_ticks]
+
+# Set the custom radial tick labels
+ax.set_yticklabels(r_labels)
+
+ax.set_thetagrids(np.linspace(0.0, 360.0, 13))
+
+# Set the title for the figure
+fig.suptitle('DZZ_3 Radar Polar Plot', fontsize=24, color='white')
+
+# Initialize data for radar points
+angles = np.deg2rad(np.arange(0, 360, 0.9))  # angles in radians
+dists = np.zeros_like(angles)  # distance values initialized to zero
+
+# Plot for the sweeping arm and radar points
+line1, = ax.plot([], [], color='w', linewidth=1.0)  # Sweeping arm
+pols, = ax.plot([], [], 'wo')  # Radar points, plotted as white circles
+
+# Initialize the sweeping arm at 0 degrees and radar points
+def init():
+    line1.set_data([], [])
+    pols.set_data([], [])
+    return line1, pols
+
+# Update function for the animation
+update_interval = 5  # Update plot every 5 frames
+update_count = 0
+
+def update(frame):
+    global total_steps, dists, update_count, angle_degrees, target_distances, radar_distance
+    global rotation_counter  # Add a global counter for rotations
+
+    # Calculate the current angle in radians based on the total number of steps
+    angle_rad = np.deg2rad((total_steps % steps_per_rev) * (360 / steps_per_rev))
+    # Update the sweeping arm position
+    line1.set_data([angle_rad, angle_rad], [0, r_max])
+    
+    # Increment the rotation counter and reset distance array if a full rotation is completed
+    if total_steps % steps_per_rev == 0:
+        rotation_counter += 1
+        if rotation_counter >= steps_per_rev / update_interval:
+            dists[:] = 0  # Clear previous rotation's data
+            rotation_counter = 0  # Reset rotation counter
+
+    # Update radar points data every update_interval frames
+    if update_count % update_interval == 0:
+        radar_data = get_radar_data()
+        for distance, _ in radar_data:
+            # Calculate the index in the distance array corresponding to the current step
+            index = int((total_steps % steps_per_rev) * len(angles) / steps_per_rev)
+            radar_distance = distance
+            dists[index] = distance  # Update distance with real sensor data
+
+        # Update the radar points plot
+        pols.set_data(angles, dists)
+
+        # Calculate the current angle in degrees
+        angle_degrees = (total_steps % steps_per_rev) * (360 / steps_per_rev)
+        # Extract target distances from radar data
+        target_distances = [distance for distance, _ in radar_data]
+        # Save the current data to CSV
+        save_data_to_csv(rpmx, angle_degrees, target_distances)
+    update_count += 1
+
+    return line1, pols
+
+# Motor control thread
+def motor_control():
+    global total_steps, delay_secs_motor, motor_running
+    while True:
+        with lock:
+            step_delay = delay_secs_motor  
+            running = motor_running  
+
+        if running:
+            GPIO.output(STEP, GPIO.HIGH)
+            time.sleep(step_delay / 2)
+            GPIO.output(STEP, GPIO.LOW)
+            time.sleep(step_delay / 2)
+            total_steps += 1
+            print(f"Motor step: total_steps: {total_steps}, delay_secs_motor: {step_delay}")
+        else:
+            time.sleep(0.1)  
+
+# Fetch RPM periodically
+def periodic_rpm_fetch():
+    global rpmx
+    while True:
+        rpmx = fetch_rpm()
+        time.sleep(1)
+
+# Create a lock for thread synchronization
+lock = threading.Lock()
+    
+# Create threads for motor control and fetching RPM
+rpm_fetch_thread = threading.Thread(target=periodic_rpm_fetch)
+rpm_fetch_thread.start()
+
+motor_thread = threading.Thread(target=motor_control)
+motor_thread.start()
+
+firebase_update_thread = threading.Thread(target=test_update_distance)
+firebase_update_thread.start()
+
+# Create an animation object
+ani = FuncAnimation(fig, update, frames=np.arange(0, steps_per_rev), init_func=init, blit=True, repeat=True, interval=1)
+
+plt.show()
+
+# Clean up resources after the animation is done
+cleanup()
+csv_file.close()
